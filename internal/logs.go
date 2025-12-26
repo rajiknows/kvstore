@@ -60,7 +60,6 @@ func Decode(r io.Reader) (*Log, error) {
 	if _, err := io.ReadFull(r, e.Key); err != nil {
 		return nil, err
 	}
-
 	var vlen int32
 	if err := binary.Read(r, binary.BigEndian, &vlen); err != nil {
 		return nil, err
