@@ -1,3 +1,4 @@
+// Package raft
 package raft
 
 import (
@@ -7,7 +8,7 @@ import (
 	"time"
 )
 
-const DebugCM =1
+const DebugCM = 1
 
 // let's implement raft from scratch here
 // its gonna be intreresting lets see
@@ -16,6 +17,7 @@ const DebugCM =1
 // not gonna sleep unless i implement it
 
 type CmState int
+
 const (
 	Follower CmState = iota
 	Candidate
@@ -23,34 +25,44 @@ const (
 	Dead
 )
 
-type LogEntry struct{
+type LogEntry struct {
 	Command any
-	Term int
+	Term    int
 }
 
-type ConsensusModule struct{
+type ConsensusModule struct {
 	mu sync.Mutex
 	// id is the serverId of the node
 	id int
 
 	// server is the server containing this cm and it is used for rpc comm
-	server *Server
+	server *Cluster
 
 	// peerIds list the ids of the nodes
 	peerIds []int
 
 	// Persistant raft state
 	currentTerm int
-	votedFor int
-	log []LogEntry
-
+	votedFor    int
+	log         []LogEntry
 
 	// volatile state
-	state CmState
+	state       CmState
+	commitIndex int // index of the highest commited log entry
+	lastApplied int // index of highest log entry applied to the log index
+
+	// volatile state on leaders
+	nextIndex  map[int]int // for each server, index of the next log entry to send
+	matchIndex map[int]int // for each server index of highest log entry to be replicated
+
 	electionResetEvent time.Time
 }
 
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any) *ConsensusModule {
+// TODO: jan 5
+//
+// make the currentTerm , votedFor and full LogEntry persistant in the disk
+
+func NewConsensusModule(id int, peerIds []int, server *Cluster, ready <-chan any) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
@@ -76,42 +88,41 @@ func (cm *ConsensusModule) Stop() {
 	cm.dlog("becomes Dead")
 }
 
-func (cm *ConsensusModule) electionTimeout() time.Duration{
-	return time.Duration(150 + rand.Intn(150))*time.Millisecond
+func (cm *ConsensusModule) electionTimeout() time.Duration {
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 
-func (cm *ConsensusModule) dlog(format string, args ...any){
-	if DebugCM>0{
-		fmt.Println(fmt.Sprintf("[%d] ", cm.id)+format , args)
+func (cm *ConsensusModule) dlog(format string, args ...any) {
+	if DebugCM > 0 {
+		fmt.Println(fmt.Sprintf("[%d] ", cm.id)+format, args)
 	}
 }
 
-func (cm *ConsensusModule) runElectionTimer(){
+func (cm *ConsensusModule) runElectionTimer() {
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
 	termStarted := cm.currentTerm
 	cm.mu.Unlock()
 	cm.dlog("election timer start (%v), term = %d", timeoutDuration, termStarted)
 
-
-	ticker  := time.NewTicker(10* time.Millisecond)
-	for{
+	ticker := time.NewTicker(10 * time.Millisecond)
+	for {
 		<-ticker.C
 
 		cm.mu.Lock()
-		if cm.state!= Candidate && cm.state!= Follower{
+		if cm.state != Candidate && cm.state != Follower {
 			cm.dlog("in election timer state=%s, bailing out", cm.state)
 			cm.mu.Unlock()
 			return
 		}
 
-		if termStarted!= cm.currentTerm {
-			cm.dlog("in election timer term changed from %d to %d, bailing out ",termStarted, cm.currentTerm )
+		if termStarted != cm.currentTerm {
+			cm.dlog("in election timer term changed from %d to %d, bailing out ", termStarted, cm.currentTerm)
 			cm.mu.Unlock()
 			return
 		}
 
-		if elapsed := time.Since(cm.electionResetEvent); elapsed<timeoutDuration{
+		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
 			cm.startElection()
 			cm.mu.Unlock()
 			return
@@ -121,8 +132,8 @@ func (cm *ConsensusModule) runElectionTimer(){
 	}
 }
 
-type RequestVoteArgs struct{
-	Term int
+type RequestVoteArgs struct {
+	Term        int
 	CandidateId int
 }
 
@@ -130,46 +141,46 @@ type RequestVoteArgs struct{
 
 // }
 
-func (cm *ConsensusModule) startElection(){
+func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
 	savedCurrentTerm := cm.currentTerm
-	cm.electionResetEvent =time.Now()
+	cm.electionResetEvent = time.Now()
 	// vote yourself
 	cm.votedFor = cm.id
 	cm.dlog("becomes candidate (currentTerm = %d); log = %v", savedCurrentTerm, cm.log)
 
-
 	votesReceived := 1
 
-	for _,peerId := range cm.peerIds{
-		go func(){
-			args:= RequestVoteArgs{
-				Term: savedCurrentTerm,
+	// request all connected peers for vote
+	for _, peerId := range cm.peerIds {
+		go func() {
+			args := RequestVoteArgs{
+				Term:        savedCurrentTerm,
 				CandidateId: cm.id,
 			}
 
 			var reply RequestVoteReply
 			cm.dlog("sending request vote to peer = %d , args = %+v", peerId, args)
-			if err:= cm.server.Call(peerId, "REQUESTVOTE", args, &reply); err==nil{
+			if err := cm.server.Call(peerId, "REQUESTVOTE", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 
 				cm.dlog("recieved reply from peer = %d , reply = %+v", peerId, reply)
 
-				if cm.state != Candidate{
+				if cm.state != Candidate {
 					cm.dlog("while waiting for reply state changed to %d", cm.state)
 					return
 				}
 
-				if reply.Term > savedCurrentTerm{
+				if reply.Term > savedCurrentTerm {
 					cm.dlog("term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term)
 					return
-				}else if reply.Term == savedCurrentTerm{
+				} else if reply.Term == savedCurrentTerm {
 					if reply.VoteGranted {
-						votesReceived+=1
-						if votesReceived*2 > len(cm.peerIds) + 1{
+						votesReceived += 1
+						if votesReceived*2 > len(cm.peerIds)+1 {
 							// won the election
 							cm.dlog("won the election with %d votes", votesReceived)
 							cm.StartLeader()
@@ -194,23 +205,31 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	go cm.runElectionTimer()
 }
 
-func (cm *ConsensusModule) StartLeader(){
-	cm.state= Leader
+func (cm *ConsensusModule) StartLeader() {
+	cm.mu.Unlock()
+	defer cm.mu.Lock()
+	cm.state = Leader
 	cm.dlog("becomes leader term = %d , log = %+v", cm.currentTerm, cm.log)
+	cm.nextIndex = make(map[int]int)
+	cm.matchIndex = make(map[int]int)
+	lastLogIndex := len(cm.log)
 
+	for _, peer := range cm.peerIds {
+		cm.nextIndex[peer] = lastLogIndex
+		cm.matchIndex[peer] = 0
+	}
 
-	go func(){
+	go func() {
 		// send periodic heartbeats
-		ticker := time.NewTicker(50 *time.Millisecond)
+		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 
-		for{
+		for {
 			cm.leaderSendHeartBeats()
 			<-ticker.C
 
-
 			cm.mu.Lock()
-			if cm.state!=Leader{
+			if cm.state != Leader {
 				cm.mu.Unlock()
 				return
 			}
@@ -219,9 +238,9 @@ func (cm *ConsensusModule) StartLeader(){
 	}()
 }
 
-func (cm *ConsensusModule) leaderSendHeartBeats(){
+func (cm *ConsensusModule) leaderSendHeartBeats() {
 	cm.mu.Lock()
-	if cm.state != Leader{
+	if cm.state != Leader {
 		cm.mu.Unlock()
 		return
 	}
@@ -229,16 +248,15 @@ func (cm *ConsensusModule) leaderSendHeartBeats(){
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
-
-	for _, peerId := range cm.peerIds{
+	for _, peerID := range cm.peerIds {
 		args := AppendEntriesArgs{
-			Term: savedCurrentTerm,
-			LeaderId: cm.id,
+			Term:     savedCurrentTerm,
+			LeaderID: cm.id,
 		}
-		go func(){
-			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
+		go func() {
+			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerID, 0, args)
 			var reply AppendEntriesReply
-			if err := cm.server.Call(peerId, "APPENDENTRIES", args, &reply); err == nil {
+			if err := cm.server.Call(peerID, "APPENDENTRIES", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				if reply.Term > savedCurrentTerm {
@@ -250,12 +268,11 @@ func (cm *ConsensusModule) leaderSendHeartBeats(){
 		}()
 
 	}
-
 }
 
 type AppendEntriesArgs struct {
 	Term     int
-	LeaderId int
+	LeaderID int
 
 	PrevLogIndex int
 	PrevLogTerm  int
@@ -299,7 +316,6 @@ type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
 }
-
 
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	cm.mu.Lock()

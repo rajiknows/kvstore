@@ -10,129 +10,128 @@ import (
 	"sync"
 	"time"
 )
-type Server struct{
 
+type Cluster struct {
 	mu sync.Mutex
 
+	serverID int
+	peerIds  []int
 
-	serverId int
-	peerIds []int
-
-	cm *ConsensusModule
+	cm       *ConsensusModule
 	rpcproxy *RPCProxy
 
 	rpcserver *rpc.Server
-	listener net.Listener
+	listener  net.Listener
 
 	peerClients map[int]*rpc.Client
 
 	ready <-chan any
-	quit chan any
-	wg sync.WaitGroup
+	quit  chan any
+	wg    sync.WaitGroup
 }
 
-
-
-func newServer(serverId int , peerIds []int , ready <-chan any) *Server{
-	s:= new(Server)
-	s.serverId = serverId
-	s.peerIds =peerIds
-	s.peerClients= make(map[int]*rpc.Client)
+func NewCluster(serverID int, peerIds []int, ready <-chan any) *Cluster {
+	s := new(Cluster)
+	s.serverID = serverID
+	s.peerIds = peerIds
+	s.peerClients = make(map[int]*rpc.Client)
 	s.ready = ready
 	s.quit = make(chan any)
 	return s
 }
 
-func (s *Server) Serve(){
+func (s *Cluster) Serve() {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready)
+	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.ready)
 	s.rpcserver = rpc.NewServer()
-	s.rpcserver.RegisterName("ConsensusModule",s.rpcproxy )
-
-	var err error
-	s.listener , err = net.Listen("tcp", ";0")
-	if err!=nil{
+	err := s.rpcserver.RegisterName("ConsensusModule", s.rpcproxy)
+	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("[%v] listening at %s", s.serverId, s.listener.Addr())
+	// var err error
+	s.listener, err = net.Listen("tcp", ";0")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("[%v] listening at %s", s.serverID, s.listener.Addr())
 	s.mu.Unlock()
 
-
-	s.wg.Add(1)
-	go func(){
-		defer s.wg.Done()
-
-
-		for{
+	s.wg.Go(func() {
+		for {
 			conn, err := s.listener.Accept()
-			if err!=nil{
-				select{
-					case <- s.quit:
+			if err != nil {
+				select {
+				case <-s.quit:
 					return
-					default:
+				default:
 					log.Fatal("accept error")
 				}
 			}
-			s.wg.Add(1)
-			go func(){
+			s.wg.Go(func() {
 				s.rpcserver.ServeConn(conn)
-				s.wg.Done()
-			}()
+			})
 		}
-	}()
+	})
 }
 
-func (s *Server) DisconnectAll() {
+func (s *Cluster) DisconnectAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id := range s.peerClients {
 		if s.peerClients[id] != nil {
-			s.peerClients[id].Close()
+			err := s.peerClients[id].Close()
+			if err != nil {
+				fmt.Printf("failed to close a peerClient id = %d", id)
+			}
 			s.peerClients[id] = nil
 		}
 	}
 }
 
-func (s *Server) Shutdown() {
+func (s *Cluster) Shutdown() {
 	s.cm.Stop()
 	close(s.quit)
-	s.listener.Close()
+	err := s.listener.Close()
+	if err != nil {
+		fmt.Printf("failed to close a Listner")
+	}
 	s.wg.Wait()
 }
 
-func (s *Server) GetListenAddr() net.Addr {
+func (s *Cluster) GetListenAddr() net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.listener.Addr()
 }
 
-func (s *Server) ConnectToPeer(peerId int, addr net.Addr) error{
+func (s *Cluster) ConnectToPeer(peerID int, addr net.Addr) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.peerClients[peerId] == nil{
-		client , err  := rpc.Dial(addr.Network(),addr.String())
-		if err!=nil{
+	if s.peerClients[peerID] == nil {
+		client, err := rpc.Dial(addr.Network(), addr.String())
+		if err != nil {
 			return err
 		}
-		s.peerClients[peerId]= client
+		s.peerClients[peerID] = client
 	}
 	return nil
 }
 
-func (s *Server) DisconnectPeer(peerId int) error {
+func (s *Cluster) DisconnectPeer(peerID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.peerClients[peerId] != nil {
-		err := s.peerClients[peerId].Close()
-		s.peerClients[peerId] = nil
+	if s.peerClients[peerID] != nil {
+		err := s.peerClients[peerID].Close()
+		s.peerClients[peerID] = nil
 		return err
 	}
 	return nil
 }
 
-func (s *Server) Call(id int, serviceMethod string, args any, reply any) error {
+func (s *Cluster) Call(id int, serviceMethod string, args any, reply any) error {
 	s.mu.Lock()
 	peer := s.peerClients[id]
 	s.mu.Unlock()
@@ -151,10 +150,11 @@ type RPCProxy struct {
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)
-		if dice == 9 {
+		switch dice {
+		case 9:
 			rpp.cm.dlog("drop RequestVote")
 			return fmt.Errorf("RPC failed")
-		} else if dice == 8 {
+		case 8:
 			rpp.cm.dlog("delay RequestVote")
 			time.Sleep(75 * time.Millisecond)
 		}
@@ -167,10 +167,11 @@ func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) 
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)
-		if dice == 9 {
+		switch dice {
+		case 9:
 			rpp.cm.dlog("drop AppendEntries")
 			return fmt.Errorf("RPC failed")
-		} else if dice == 8 {
+		case 8:
 			rpp.cm.dlog("delay AppendEntries")
 			time.Sleep(75 * time.Millisecond)
 		}

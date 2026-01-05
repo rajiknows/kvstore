@@ -3,11 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"kvstore/internal"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+
+	"kvstore/internal"
+	"kvstore/internal/raft"
 )
 
 func main() {
@@ -16,8 +18,12 @@ func main() {
 	logfile, err := os.OpenFile(
 		"kvlog",
 		os.O_CREATE|os.O_RDWR|os.O_APPEND,
-		0644,
+		0o644,
 	)
+	ready := make(chan any)
+	defer close(ready)
+	server := raft.NewCluster(1, []int{}, ready)
+	server.Serve()
 
 	if err := internal.ReplayWAL(logfile, store); err != nil {
 		panic(err)
