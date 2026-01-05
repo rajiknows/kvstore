@@ -6,34 +6,50 @@ import (
 	"os"
 )
 
-func (cm *ConsensusModule) Persist() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+type RaftState struct {
+	CurrentTerm int
+	VotedFor    int
+	Log         []LogEntry
+}
 
-	// persist the voting state in a file
+func (cm *ConsensusModule) Persist() {
+	state := RaftState{
+		CurrentTerm: cm.currentTerm,
+		VotedFor:    cm.votedFor,
+		Log:         cm.log,
+	}
 	file, err := os.Create(fmt.Sprintf("raft_state-%d.bin", cm.id))
 	if err != nil {
+		cm.dlog("error in creating persist file: %v", err)
 		return
 	}
 	defer file.Close()
 
 	enc := gob.NewEncoder(file)
-	data := struct {
-		CurrentTime int
-		VotedFor    int
-		log         []LogEntry
-	}{cm.currentTerm, cm.votedFor, cm.log}
-	err = enc.Encode(data)
-	if err != nil {
-		cm.dlog("error in encoding persist data")
-		return
-	}
-	err = file.Sync()
-	if err != nil {
-		cm.dlog("error in encoding persist data")
-		return
+	if err := enc.Encode(state); err != nil {
+		cm.dlog("error in encoding persist data: %v", err)
 	}
 }
 
 func (cm *ConsensusModule) Load() {
+	file, err := os.Open(fmt.Sprintf("raft_state-%d.bin", cm.id))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		cm.dlog("error in opening persist file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	var state RaftState
+	dec := gob.NewDecoder(file)
+	if err := dec.Decode(&state); err != nil {
+		cm.dlog("error in decoding persist data: %v", err)
+		return
+	}
+
+	cm.currentTerm = state.CurrentTerm
+	cm.votedFor = state.VotedFor
+	cm.log = state.Log
 }

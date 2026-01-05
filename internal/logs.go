@@ -10,12 +10,21 @@ import (
 	"sync"
 )
 
+type Op byte
+
+const (
+	_ Op = iota
+	OpGet
+	OpPut
+	OpDelete
+)
+
 // so lets design a on-disk logs format
 type Log struct {
 	// 1->  get
 	// 2-> put
 	// 3-> delete
-	Op    byte
+	Op    Op
 	Key   []byte
 	Value []byte
 }
@@ -23,7 +32,7 @@ type Log struct {
 func (e *Log) Encode() ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := buf.WriteByte(e.Op); err != nil {
+	if err := buf.WriteByte(byte(e.Op)); err != nil {
 		return nil, err
 	}
 
@@ -47,10 +56,11 @@ func (e *Log) Encode() ([]byte, error) {
 
 func Decode(r io.Reader) (*Log, error) {
 	var e Log
-
-	if err := binary.Read(r, binary.BigEndian, &e.Op); err != nil {
+	var op byte
+	if err := binary.Read(r, binary.BigEndian, &op); err != nil {
 		return nil, err
 	}
+	e.Op = Op(op)
 
 	var klen int32
 	if err := binary.Read(r, binary.BigEndian, &klen); err != nil {
@@ -76,7 +86,7 @@ func Decode(r io.Reader) (*Log, error) {
 
 	// verify checksum
 	buf := new(bytes.Buffer)
-	buf.WriteByte(e.Op)
+	buf.WriteByte(byte(e.Op))
 	binary.Write(buf, binary.BigEndian, klen)
 	buf.Write(e.Key)
 	binary.Write(buf, binary.BigEndian, vlen)
@@ -120,10 +130,10 @@ func ReplayWAL(f *os.File, store *Kvstore) error {
 		}
 
 		switch entry.Op {
-		case 2:
+		case OpPut:
 			store.Put(string(entry.Key), string(entry.Value))
 
-		case 3:
+		case OpDelete:
 			store.Delete(string(entry.Key))
 		}
 

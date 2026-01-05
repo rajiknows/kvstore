@@ -2,61 +2,127 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
-	"net/http"
-	"os"
-	"strings"
-	"sync"
-
 	"kvstore/internal"
 	"kvstore/internal/raft"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
 )
 
 func main() {
-	store := internal.NewStore()
-
-	logfile, err := os.OpenFile(
-		"kvlog",
-		os.O_CREATE|os.O_RDWR|os.O_APPEND,
-		0o644,
+	var (
+		id          int
+		httpAddr    string
+		raftAddr    string
+		cluster     string
+		clusterHttp string
 	)
+
+	flag.IntVar(&id, "id", 0, "node ID")
+	flag.StringVar(&httpAddr, "http-addr", "localhost:8080", "client-facing HTTP server address")
+	flag.StringVar(&raftAddr, "raft-addr", "localhost:9090", "raft server address")
+	flag.StringVar(&cluster, "cluster", "", "comma-separated list of raft addresses in the cluster")
+	flag.StringVar(&clusterHttp, "cluster-http", "", "comma-separated list of http addresses in the cluster")
+	flag.Parse()
+
+	if id == 0 {
+		log.Fatal("id is required")
+	}
+
+	peerAddrs := strings.Split(cluster, ",")
+	peerIds := make([]int, 0, len(peerAddrs))
+	peerIdToAddr := make(map[int]string)
+	for _, addr := range peerAddrs {
+		parts := strings.Split(addr, "=")
+		if len(parts) != 2 {
+			log.Fatalf("invalid peer address: %s", addr)
+		}
+		peerId, err := strconv.Atoi(parts[0])
+		if err != nil {
+			log.Fatalf("invalid peer id: %s", parts[0])
+		}
+		peerIds = append(peerIds, peerId)
+		peerIdToAddr[peerId] = parts[1]
+	}
+
+	peerHttpAddrs := strings.Split(clusterHttp, ",")
+	peerIdToHttpAddr := make(map[int]string)
+	for _, addr := range peerHttpAddrs {
+		parts := strings.Split(addr, "=")
+		if len(parts) != 2 {
+			log.Fatalf("invalid peer http address: %s", addr)
+		}
+		peerId, err := strconv.Atoi(parts[0])
+		if err != nil {
+			log.Fatalf("invalid peer id: %s", parts[0])
+		}
+		peerIdToHttpAddr[peerId] = parts[1]
+	}
+
+	store := internal.NewStore()
+	commitChan := make(chan internal.Log)
+
 	ready := make(chan any)
-	defer close(ready)
-	server := raft.NewCluster(1, []int{}, ready)
-	server.Serve()
+	raftServer := raft.NewServer(id, peerIds, ready, commitChan)
+	raftServer.Serve(raftAddr)
+	close(ready)
 
-	if err := internal.ReplayWAL(logfile, store); err != nil {
-		panic(err)
+	go func() {
+		for command := range commitChan {
+			switch command.Op {
+			case internal.OpPut:
+				store.Put(string(command.Key), string(command.Value))
+			case internal.OpDelete:
+				store.Delete(string(command.Key))
+			}
+		}
+	}()
+
+	for peerId, addr := range peerIdToAddr {
+		if peerId == id {
+			continue
+		}
+		err := raftServer.ConnectToPeer(peerId, addr)
+		if err != nil {
+			log.Fatalf("failed to connect to peer %d at %s: %v", peerId, addr, err)
+		}
 	}
 
-	if err != nil {
-		panic("unable to open logfile")
-	}
-	defer logfile.Close()
+	http.HandleFunc("/get/", getHandler(store, raftServer, id, peerIdToHttpAddr))
+	http.HandleFunc("/put/", putHandler(raftServer, id, peerIdToHttpAddr))
+	http.HandleFunc("/delete/", deleteHandler(raftServer, id, peerIdToHttpAddr))
 
-	var logMu sync.Mutex
-
-	http.HandleFunc("/get/", getHandler(store, logfile, &logMu))
-	http.HandleFunc("/put/", putHandler(store, logfile, &logMu))
-	http.HandleFunc("/delete/", deleteHandler(store, logfile, &logMu))
-
-	fmt.Println("Server running on port 8080")
-	http.ListenAndServe(":8080", nil)
+	fmt.Printf("Server running on %s\n", httpAddr)
+	http.ListenAndServe(httpAddr, nil)
 }
 
 type PutRequest struct {
 	Value string `json:"value"`
 }
 
-func putHandler(store *internal.Kvstore, logfile *os.File, logmu *sync.Mutex) http.HandlerFunc {
+func putHandler(raftServer *raft.Server, id int, peerIdToHttpAddr map[int]string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		id := strings.TrimPrefix(r.URL.Path, "/put/")
-		if id == "" {
+		leaderId := raftServer.GetLeaderId()
+		if leaderId != id {
+			leaderAddr, ok := peerIdToHttpAddr[leaderId]
+			if !ok {
+				http.Error(w, "leader not found", http.StatusServiceUnavailable)
+				return
+			}
+			http.Redirect(w, r, "http://"+leaderAddr+r.URL.Path, http.StatusTemporaryRedirect)
+			return
+		}
+
+		key := strings.TrimPrefix(r.URL.Path, "/put/")
+		if key == "" {
 			http.Error(w, "id is required", http.StatusBadRequest)
 			return
 		}
@@ -67,19 +133,15 @@ func putHandler(store *internal.Kvstore, logfile *os.File, logmu *sync.Mutex) ht
 			return
 		}
 
-		entry := &internal.Log{
-			Op:    2, // PUT
-			Key:   []byte(id),
+		command := internal.Log{
+			Op:    internal.OpPut,
+			Key:   []byte(key),
 			Value: []byte(reqbody.Value),
 		}
 
-		if err := internal.WriteLog(logmu, logfile, entry); err != nil {
-			http.Error(w, "wal write failed", http.StatusInternalServerError)
-			return
-		}
-
-		if err := store.Put(id, reqbody.Value); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		_, err := raftServer.Submit(command)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 
@@ -87,31 +149,38 @@ func putHandler(store *internal.Kvstore, logfile *os.File, logmu *sync.Mutex) ht
 	}
 }
 
-func deleteHandler(store *internal.Kvstore, logfile *os.File, logmu *sync.Mutex) http.HandlerFunc {
+func deleteHandler(raftServer *raft.Server, id int, peerIdToHttpAddr map[int]string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		id := strings.TrimPrefix(r.URL.Path, "/delete/")
-		if id == "" {
+		leaderId := raftServer.GetLeaderId()
+		if leaderId != id {
+			leaderAddr, ok := peerIdToHttpAddr[leaderId]
+			if !ok {
+				http.Error(w, "leader not found", http.StatusServiceUnavailable)
+				return
+			}
+			http.Redirect(w, r, "http://"+leaderAddr+r.URL.Path, http.StatusTemporaryRedirect)
+			return
+		}
+
+		key := strings.TrimPrefix(r.URL.Path, "/delete/")
+		if key == "" {
 			http.Error(w, "id is required", http.StatusBadRequest)
 			return
 		}
 
-		entry := &internal.Log{
-			Op:  3, // DELETE
-			Key: []byte(id),
+		command := internal.Log{
+			Op:  internal.OpDelete,
+			Key: []byte(key),
 		}
 
-		if err := internal.WriteLog(logmu, logfile, entry); err != nil {
-			http.Error(w, "wal write failed", http.StatusInternalServerError)
-			return
-		}
-
-		if err := store.Delete(id); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		_, err := raftServer.Submit(command)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 
@@ -119,15 +188,26 @@ func deleteHandler(store *internal.Kvstore, logfile *os.File, logmu *sync.Mutex)
 	}
 }
 
-func getHandler(store *internal.Kvstore, logfile *os.File, logmu *sync.Mutex) http.HandlerFunc {
+func getHandler(store *internal.Kvstore, raftServer *raft.Server, id int, peerIdToHttpAddr map[int]string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimPrefix(r.URL.Path, "/get/")
-		if id == "" {
+		leaderId := raftServer.GetLeaderId()
+		if leaderId != id {
+			leaderAddr, ok := peerIdToHttpAddr[leaderId]
+			if !ok {
+				http.Error(w, "leader not found", http.StatusServiceUnavailable)
+				return
+			}
+			http.Redirect(w, r, "http://"+leaderAddr+r.URL.Path, http.StatusTemporaryRedirect)
+			return
+		}
+
+		key := strings.TrimPrefix(r.URL.Path, "/get/")
+		if key == "" {
 			http.Error(w, "id is required", http.StatusBadRequest)
 			return
 		}
 
-		val, exists, err := store.Get(id)
+		val, exists, err := store.Get(key)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

@@ -5,14 +5,12 @@ import (
 	"sync"
 )
 
-// this is the Basic interface of a kv-store
 type Store interface {
 	Get(key string) (val string, exists bool, err error)
 	Put(key, val string) error
 	Delete(key string) error
 }
 
-// the most basic form of a kv-store just a string  -> string map
 type Kvstore struct {
 	mu   sync.Mutex
 	data map[string]string
@@ -23,6 +21,7 @@ func NewStore() *Kvstore {
 		data: make(map[string]string),
 	}
 }
+
 func (kv *Kvstore) Get(key string) (string, bool, error) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
