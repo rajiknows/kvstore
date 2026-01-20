@@ -3,10 +3,11 @@ package raft
 
 import (
 	"fmt"
-	"kvstore/internal"
 	"math/rand"
 	"sync"
 	"time"
+
+	"kvstore/internal"
 )
 
 const DebugCM = 1
@@ -58,7 +59,7 @@ type ConsensusModule struct {
 
 	// volatile state
 	state       CmState
-	leaderId    int
+	leaderID    int
 	commitIndex int // index of the highest commited log entry
 	lastApplied int // index of highest log entry applied to the log index
 
@@ -78,7 +79,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any,
 	cm.server = server
 	cm.state = Follower
 	cm.votedFor = -1
-	cm.leaderId = -1
+	cm.leaderID = -1
 	cm.commitIndex = -1
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
@@ -104,9 +105,10 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any,
 func (cm *ConsensusModule) GetLeaderId() int {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	return cm.leaderId
+	return cm.leaderID
 }
 
+// commitApplier() applies the commits to the followers
 func (cm *ConsensusModule) commitApplier() {
 	for range cm.newCommitReadyChan {
 		cm.mu.Lock()
@@ -140,9 +142,12 @@ func (cm *ConsensusModule) Submit(command internal.Log) (bool, error) {
 		return false, fmt.Errorf("not a leader")
 	}
 
+	// save the log to the state
 	cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+	// persist this state to the persistant storage
 	cm.Persist()
 	cm.dlog("Submit: %+v", command)
+	// send a sigal that new commit is ready
 	cm.newCommitReadyChan <- struct{}{}
 	return true, nil
 }
@@ -159,9 +164,10 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 
+// a custom logger which activates only in debug mode
 func (cm *ConsensusModule) dlog(format string, args ...any) {
 	if DebugCM > 0 {
-		format = fmt.Sprintf("[%d] [%s] term=%d commit=%d lastApplied=%d leader=%d: ", cm.id, cm.state, cm.currentTerm, cm.commitIndex, cm.lastApplied, cm.leaderId) + format
+		format = fmt.Sprintf("[%d] [%s] term=%d commit=%d lastApplied=%d leader=%d: ", cm.id, cm.state, cm.currentTerm, cm.commitIndex, cm.lastApplied, cm.leaderID) + format
 		fmt.Println(fmt.Sprintf(format, args...))
 	}
 }
@@ -202,7 +208,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 type RequestVoteArgs struct {
 	Term         int
-	CandidateId  int
+	CandidateID  int
 	LastLogIndex int
 	LastLogTerm  int
 }
@@ -213,7 +219,7 @@ func (cm *ConsensusModule) startElection() {
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
-	cm.leaderId = -1
+	cm.leaderID = -1
 	cm.Persist()
 	cm.dlog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
@@ -227,7 +233,7 @@ func (cm *ConsensusModule) startElection() {
 
 			args := RequestVoteArgs{
 				Term:         savedCurrentTerm,
-				CandidateId:  cm.id,
+				CandidateID:  cm.id,
 				LastLogIndex: lastLogIndex,
 				LastLogTerm:  lastLogTerm,
 			}
@@ -270,7 +276,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.state = Follower
 	cm.currentTerm = term
 	cm.votedFor = -1
-	cm.leaderId = -1
+	cm.leaderID = -1
 	cm.Persist()
 	cm.electionResetEvent = time.Now()
 
@@ -279,7 +285,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 
 func (cm *ConsensusModule) StartLeader() {
 	cm.state = Leader
-	cm.leaderId = cm.id
+	cm.leaderID = cm.id
 	cm.dlog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
 
 	cm.nextIndex = make(map[int]int)
@@ -410,7 +416,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		if cm.state != Follower {
 			cm.becomeFollower(args.Term)
 		}
-		cm.leaderId = args.LeaderID
+		cm.leaderID = args.LeaderID
 		cm.electionResetEvent = time.Now()
 
 		if args.PrevLogIndex == -1 ||
@@ -472,12 +478,12 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 
 	if cm.currentTerm == args.Term &&
-		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+		(cm.votedFor == -1 || cm.votedFor == args.CandidateID) {
 		lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
 		if (args.LastLogTerm > lastLogTerm) ||
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			reply.VoteGranted = true
-			cm.votedFor = args.CandidateId
+			cm.votedFor = args.CandidateID
 			cm.Persist()
 			cm.electionResetEvent = time.Now()
 		}

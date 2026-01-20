@@ -2,17 +2,18 @@ package raft
 
 import (
 	"fmt"
-	"kvstore/internal"
 	"log"
 	"net"
 	"net/rpc"
 	"sync"
+
+	"kvstore/internal"
 )
 
 type Server struct {
 	mu sync.Mutex
 
-	serverId int
+	serverID int
 	peerIds  []int
 
 	cm *ConsensusModule
@@ -27,18 +28,18 @@ type Server struct {
 	wg    sync.WaitGroup
 }
 
-func NewServer(serverId int, peerIds []int, ready <-chan any, commitChan chan<- internal.Log) *Server {
+func NewServer(serverID int, peerIds []int, ready <-chan any, commitChan chan<- internal.Log) *Server {
 	s := new(Server)
-	s.serverId = serverId
+	s.serverID = serverID
 	s.peerIds = peerIds
 	s.peerClients = make(map[int]*rpc.Client)
 	s.ready = ready
 	s.quit = make(chan any)
-	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready, commitChan)
+	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.ready, commitChan)
 	return s
 }
 
-func (s *Server) GetLeaderId() int {
+func (s *Server) GetLeaderID() int {
 	return s.cm.GetLeaderId()
 }
 
@@ -55,13 +56,10 @@ func (s *Server) Serve(addr string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("[%v] listening at %s", s.serverId, s.listener.Addr())
+	log.Printf("[%v] listening at %s", s.serverID, s.listener.Addr())
 	s.mu.Unlock()
 
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-
+	s.wg.Go(func() {
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
@@ -72,13 +70,11 @@ func (s *Server) Serve(addr string) {
 					log.Fatal("accept error:", err)
 				}
 			}
-			s.wg.Add(1)
-			go func() {
+			s.wg.Go(func() {
 				s.rpcServer.ServeConn(conn)
-				s.wg.Done()
-			}()
+			})
 		}
-	}()
+	})
 }
 
 func (s *Server) DisconnectAll() {

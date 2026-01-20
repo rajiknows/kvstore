@@ -19,33 +19,45 @@ const (
 	OpDelete
 )
 
-// so lets design a on-disk logs format
 type Log struct {
 	// 1->  get
 	// 2-> put
 	// 3-> delete
-	Op    Op
+	Op    Op // well now we have an enum
 	Key   []byte
 	Value []byte
 }
 
+// Encode : our own custom encoding function
 func (e *Log) Encode() ([]byte, error) {
 	buf := new(bytes.Buffer)
 
+	// write the Op (1 byte)
 	if err := buf.WriteByte(byte(e.Op)); err != nil {
 		return nil, err
 	}
 
+	// write the key in BigEndian format
+	//
+	//
+	// first write the len of the key
 	if err := binary.Write(buf, binary.BigEndian, int32(len(e.Key))); err != nil {
 		return nil, err
 	}
+	// write the actual key
 	buf.Write(e.Key)
 
+	// write the value into the buffer
+	//
+	//
+	// first write the len of value
 	if err := binary.Write(buf, binary.BigEndian, int32(len(e.Value))); err != nil {
 		return nil, err
 	}
+	// write the actual value
 	buf.Write(e.Value)
 
+	// calculate the checksum and write that to the buffer
 	checksum := crc32.ChecksumIEEE(buf.Bytes())
 	if err := binary.Write(buf, binary.BigEndian, checksum); err != nil {
 		return nil, err
@@ -54,6 +66,19 @@ func (e *Log) Encode() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// Decode : handmade decode function for out log format
+//
+// just like how we encode the log we decode it
+//
+// first byte is the operation
+//
+// second: the len of key
+// third : key itself
+//
+// fourth: len of value
+// fifth : value itself
+//
+// rest : checksum
 func Decode(r io.Reader) (*Log, error) {
 	var e Log
 	var op byte
@@ -115,6 +140,7 @@ func WriteLog(mu *sync.Mutex, f *os.File, entry *Log) error {
 	return f.Sync()
 }
 
+// ReplayWAL : replayes the logs stored in a file into the in-memory storage
 func ReplayWAL(f *os.File, store *Kvstore) error {
 	if _, e := f.Seek(0, 0); e != nil {
 		return e
